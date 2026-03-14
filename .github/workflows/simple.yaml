@@ -201,6 +201,38 @@ jobs:
           google-chrome --version
           echo "✅ Google Chrome installed"
 
+      - name: Install and Start Docker
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Setting up Docker..."
+
+          # Docker is pre-installed on ubuntu-latest, just ensure the service is running
+          if command -v docker &> /dev/null; then
+            echo "Docker already installed: $(docker --version)"
+          else
+            echo "Installing Docker..."
+            curl -fsSL https://get.docker.com | sudo sh
+          fi
+
+          # Ensure Docker service is running
+          sudo systemctl start docker 2>/dev/null || sudo dockerd &
+          sleep 3
+
+          # Add current user to docker group so commands work without sudo
+          sudo usermod -aG docker $USER
+
+          # Install docker compose plugin if not present
+          if ! docker compose version &> /dev/null; then
+            echo "Installing Docker Compose plugin..."
+            sudo apt-get update -q
+            sudo apt-get install -y docker-compose-plugin
+          fi
+
+          # Verify
+          docker --version
+          docker compose version
+          echo "✅ Docker is ready"
+
       - name: Install TurboVNC Server
         if: steps.config.outputs.vnc_enabled == 'true'
         run: |
@@ -287,8 +319,8 @@ jobs:
           mkdir -p "$DOWNLOADS_DIR"
 
           # Download the extension zip
-          wget -q -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
-            "https://github.com/user-attachments/files/25785950/real-botxbyte-extension.zip"
+          wget -O "$DOWNLOADS_DIR/real-botxbyte-extension.zip" \
+            "https://raw.githubusercontent.com/sanket-sakariya/test-abc/main/real-botxbyte-extension.zip"
 
           # Extract to a temp location to handle nested directories
           TEMP_EXTRACT="/tmp/extension-extract"
@@ -316,7 +348,7 @@ jobs:
           # Clean up stale/non-extension files
           rm -rf "$EXTENSION_DIR/_metadata" 2>/dev/null || true
           rm -rf "$EXTENSION_DIR/.git" 2>/dev/null || true
-          rm -f "$EXTENSION_DIR/.gitignore" "$EXTENSION_DIR/.env.dev" "$EXTENSION_DIR/README.md" "$EXTENSION_DIR/llm.txt"
+          rm -f "$EXTENSION_DIR/.gitignore" "$EXTENSION_DIR/README.md" "$EXTENSION_DIR/llm.txt"
 
           echo "Extension contents:"
           ls -la "$EXTENSION_DIR/"
@@ -338,49 +370,6 @@ jobs:
           echo "✅ BotXByte Extension setup complete"
           echo "  Extension path: $EXTENSION_DIR"
 
-      - name: Download and Setup CF AutoClick Extension
-        if: steps.config.outputs.vnc_enabled == 'true'
-        run: |
-          echo "Downloading CF AutoClick extension..."
-
-          DOWNLOADS_DIR="$HOME/Downloads"
-          EXTENSION_DIR="$DOWNLOADS_DIR/cf-autoclick-extension"
-          mkdir -p "$DOWNLOADS_DIR"
-
-          # Download the extension zip
-          wget -q -O "$DOWNLOADS_DIR/cf-autoclick-master.zip" \
-            "https://github.com/user-attachments/files/25514727/cf-autoclick-master.zip"
-
-          # Extract to a temp location to handle nested directories
-          TEMP_EXTRACT="/tmp/cf-autoclick-extract"
-          rm -rf "$TEMP_EXTRACT"
-          mkdir -p "$TEMP_EXTRACT"
-          unzip -o "$DOWNLOADS_DIR/cf-autoclick-master.zip" -d "$TEMP_EXTRACT"
-          rm "$DOWNLOADS_DIR/cf-autoclick-master.zip"
-
-          # Find where manifest.json actually is
-          MANIFEST_PATH=$(find "$TEMP_EXTRACT" -name "manifest.json" -type f | head -1)
-          if [ -z "$MANIFEST_PATH" ]; then
-            echo "❌ manifest.json not found in extracted zip!"
-            find "$TEMP_EXTRACT" -type f
-            exit 1
-          fi
-
-          ACTUAL_EXT_DIR=$(dirname "$MANIFEST_PATH")
-          echo "Found manifest.json at: $MANIFEST_PATH"
-
-          # Move to the expected location
-          rm -rf "$EXTENSION_DIR"
-          mv "$ACTUAL_EXT_DIR" "$EXTENSION_DIR"
-          rm -rf "$TEMP_EXTRACT"
-
-          echo "Extension contents:"
-          ls -la "$EXTENSION_DIR/"
-          echo "manifest.json:"
-          cat "$EXTENSION_DIR/manifest.json"
-
-          echo "✅ CF AutoClick Extension setup complete"
-          echo "  Extension path: $EXTENSION_DIR"
 
       - name: Start BotXByte Server
         if: steps.config.outputs.vnc_enabled == 'true'
@@ -503,6 +492,53 @@ jobs:
             exit 1
           fi
 
+      - name: Check Developer Mode and Update DB
+        if: steps.config.outputs.vnc_enabled == 'true'
+        run: |
+          echo "Checking Chrome developer_mode status..."
+
+          PROFILE_DIR="${{ steps.browser_profile.outputs.browser_profile_dir }}"
+          BROWSER_PROFILE_ID="${{ steps.config.outputs.browser_profile_id }}"
+          USER_ID="${{ steps.config.outputs.user_id }}"
+          WORKSPACE_ID="${{ steps.config.outputs.workspace_id }}"
+
+          # Search for "developer_mode":true in the browser profile preferences
+          IS_CHROME_EXTENSION="false"
+          if grep -rq '"developer_mode":true' "$PROFILE_DIR/" 2>/dev/null; then
+            IS_CHROME_EXTENSION="true"
+            echo "✅ developer_mode is TRUE → setting is_chrome_extension=true"
+          else
+            echo "ℹ️ developer_mode is not true (or not found) → is_chrome_extension=false"
+          fi
+
+          echo "is_chrome_extension: $IS_CHROME_EXTENSION"
+
+          # Log the grep results for debugging
+          echo "--- Developer mode grep results ---"
+          grep -ro '"developer_mode":[^,}]*' "$PROFILE_DIR/" 2>/dev/null || echo "  No developer_mode entries found"
+          echo "---"
+
+          # Update is_chrome_extension in the database via PATCH API
+          if [ -n "$BROWSER_PROFILE_ID" ] && [ "$BROWSER_PROFILE_ID" != "null" ]; then
+            RESPONSE=$(curl -s --connect-timeout 10 --max-time 30 \
+              "http://129.212.196.173/ai-management-service/api/v1/browser-profile/${BROWSER_PROFILE_ID}" \
+              -X PATCH \
+              -H "Content-Type: application/json" \
+              -H "user-id: ${USER_ID}" \
+              -H "workspace-id: ${WORKSPACE_ID}" \
+              -d "{\"is_chrome_extension\": ${IS_CHROME_EXTENSION}}")
+
+            SUCCESS=$(echo "$RESPONSE" | jq -r '.success // false')
+            if [ "$SUCCESS" = "true" ]; then
+              echo "✅ Browser profile updated: is_chrome_extension=$IS_CHROME_EXTENSION"
+            else
+              echo "⚠️ Failed to update is_chrome_extension (non-fatal)"
+              echo "$RESPONSE" | jq '.' 2>/dev/null || echo "$RESPONSE"
+            fi
+          else
+            echo "⚠️ No browser_profile_id, skipping is_chrome_extension DB update"
+          fi
+
       - name: Install cloudflared
         if: steps.config.outputs.cloudflare_enabled == 'true'
         run: |
@@ -577,7 +613,7 @@ jobs:
                 \"ingress\": [
                   {
                     \"hostname\": \"${{ steps.config.outputs.hostname }}\",
-                    \"path\": \"/(workflow|terminal|status|transcribe|profile|chrome).*\",
+                    \"path\": \"/(workflow|terminal|status|transcribe|profile|chrome|\\\\d+).*\",
                     \"service\": \"http://localhost:8766\",
                     \"originRequest\": {}
                   },
